@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Controle conservador da retroiluminacao do Avell B.ON via CLEVO ACPI/WMI."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+
+ACPI_CALL = Path("/proc/acpi/call")
+ACPI_DEVICES = Path("/sys/bus/acpi/devices")
+WMI_DEVICES = Path("/sys/bus/wmi/devices")
+DMI_ROOT = Path("/sys/class/dmi/id")
+STATE_FILE = Path("/var/lib/avell-kbd-backlight/state.json")
+LOCK_FILE = Path("/run/lock/avell-kbd-backlight.lock")
+
+CLEVO_ACPI_IDS = ("CLV0001:00", "CLV0002:00")
+CLEVO_WMI_GUID = "ABBC0F6D-8EA1-11D1-00A0-C90629100000"
+WMBB_METHOD = r"\_SB_.WMI_.WMBB"
+WMBB_SET_WHITE_BRIGHTNESS = 0x27
+WMBB_GET_WHITE_BRIGHTNESS = 0x3D
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def hardware_info() -> dict[str, object]:
+    acpi = {name: (ACPI_DEVICES / name).exists() for name in CLEVO_ACPI_IDS}
+    return {
+        "vendor": read_text(DMI_ROOT / "sys_vendor"),
+        "product": read_text(DMI_ROOT / "product_name"),
+        "board_vendor": read_text(DMI_ROOT / "board_vendor"),
+        "board": read_text(DMI_ROOT / "board_name"),
+        "bios": read_text(DMI_ROOT / "bios_version"),
+        "acpi": acpi,
+        "wmi": (WMI_DEVICES / CLEVO_WMI_GUID).exists(),
+        "acpi_call": ACPI_CALL.exists(),
+    }
+
+
+def hardware_is_compatible(info: dict[str, object]) -> bool:
+    acpi = info["acpi"]
+    assert isinstance(acpi, dict)
+    return all(acpi.values()) and bool(info["wmi"])
+
+
+def print_detection(info: dict[str, object]) -> None:
+    print(f"Fabricante: {info['vendor'] or 'desconhecido'}")
+    print(f"Produto: {info['product'] or 'desconhecido'}")
+    print(f"Placa-mae: {info['board_vendor'] or 'desconhecido'} {info['board'] or ''}".rstrip())
+    print(f"BIOS: {info['bios'] or 'desconhecido'}")
+    acpi = info["acpi"]
+    assert isinstance(acpi, dict)
+    for name, present in acpi.items():
+        print(f"ACPI {name}: {'presente' if present else 'ausente'}")
+    print(f"WMI {CLEVO_WMI_GUID}: {'presente' if info['wmi'] else 'ausente'}")
+    print(f"Modulo acpi_call: {'carregado' if info['acpi_call'] else 'nao carregado'}")
+    print(f"Compatibilidade: {'confirmada' if hardware_is_compatible(info) else 'NAO confirmada'}")
+
+
+def brightness_payload(level: int) -> int:
+    """Valida o nivel do teclado CLEVO de cor fixa."""
+    if not 0 <= level <= 2:
+        raise ValueError("o nivel deve estar entre 0 e 2")
+    return level
+
+
+def acpi_expression(command: int, argument: int) -> str:
+    return f"{WMBB_METHOD} 0 {command:#x} {argument:#x}"
+
+
+def ensure_acpi_call() -> None:
+    if ACPI_CALL.exists():
+        return
+    result = subprocess.run(
+        ["modprobe", "acpi_call"], capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0 or not ACPI_CALL.exists():
+        detail = result.stderr.strip() or "o arquivo /proc/acpi/call nao apareceu"
+        raise RuntimeError(
+            "nao foi possivel carregar acpi_call; instale acpi-call-dkms. " + detail
+        )
+
+
+def require_compatible_hardware(force: bool) -> None:
+    info = hardware_info()
+    if not hardware_is_compatible(info) and not force:
+        raise RuntimeError(
+            "IDs CLEVO esperados nao foram encontrados; use 'detect'. "
+            "A opcao --force e deliberadamente necessaria para ignorar esta protecao."
+        )
+
+
+def execute_acpi(command: int, argument: int) -> str:
+    ensure_acpi_call()
+    expression = acpi_expression(command, argument)
+    try:
+        ACPI_CALL.write_text(expression, encoding="ascii")
+        result = ACPI_CALL.read_text(encoding="ascii", errors="replace").strip()
+    except OSError as exc:
+        raise RuntimeError(f"falha ao executar a chamada ACPI: {exc}") from exc
+
+    if result.lower().startswith(("error", "ae_")):
+        raise RuntimeError(f"o firmware rejeitou a chamada ACPI: {result}")
+    return result
+
+
+def read_level(*, force: bool) -> int | None:
+    require_compatible_hardware(force)
+    if os.geteuid() != 0:
+        raise RuntimeError("leitura do hardware requer root (execute com sudo ou pkexec)")
+    result = execute_acpi(WMBB_GET_WHITE_BRIGHTNESS, 0)
+    try:
+        level = int(result, 0)
+    except ValueError:
+        return None
+    return level if 0 <= level <= 2 else None
+
+
+def write_level(level: int, *, dry_run: bool, force: bool) -> None:
+    require_compatible_hardware(force)
+    expression = acpi_expression(WMBB_SET_WHITE_BRIGHTNESS, brightness_payload(level))
+    if dry_run:
+        print(expression)
+        return
+
+    if os.geteuid() != 0:
+        raise RuntimeError("controle do hardware requer root (execute com sudo ou pkexec)")
+
+    execute_acpi(WMBB_SET_WHITE_BRIGHTNESS, level)
+
+
+def load_state() -> dict[str, int]:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        current = int(data.get("current", 0))
+        last_on = int(data.get("last_on", 2))
+        if 0 <= current <= 2 and 1 <= last_on <= 2:
+            return {"current": current, "last_on": last_on}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return {"current": 0, "last_on": 2}
+
+
+def save_state(level: int, previous: dict[str, int]) -> None:
+    if os.geteuid() != 0:
+        return
+    state = {
+        "current": level,
+        "last_on": level if level > 0 else previous.get("last_on", 2),
+    }
+    STATE_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    temporary.replace(STATE_FILE)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Controla o brilho do teclado Avell B.ON via CLEVO ACPI/WMI."
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="mostra a chamada sem acessar o hardware"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="ignora a verificacao dos IDs do firmware"
+    )
+    parser.add_argument(
+        "--print-level",
+        action="store_true",
+        help="imprime somente o nivel numerico depois da alteracao",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("detect", help="mostra a deteccao; nao altera o hardware")
+    subparsers.add_parser("on", help="liga no ultimo nivel usado (padrao: 2)")
+    subparsers.add_parser("off", help="desliga")
+    subparsers.add_parser("toggle", help="alterna entre ligado e desligado")
+    subparsers.add_parser("cycle", help="alterna entre desligado, medio e maximo")
+    restore = subparsers.add_parser("restore", help="restaura o ultimo nivel salvo")
+    restore.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="repete a escrita para tolerar o atraso do firmware (padrao: 1)",
+    )
+    restore.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help="segundos entre as tentativas (padrao: 1)",
+    )
+    brightness = subparsers.add_parser("brightness", help="define um nivel de 0 a 2")
+    brightness.add_argument("level", type=int)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command == "detect":
+        info = hardware_info()
+        print_detection(info)
+        return 0 if hardware_is_compatible(info) else 1
+
+    lock_stream = None
+    try:
+        if not args.dry_run:
+            if os.geteuid() != 0:
+                raise RuntimeError("controle do hardware requer root (execute com sudo ou pkexec)")
+            try:
+                LOCK_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                lock_stream = LOCK_FILE.open("w", encoding="ascii")
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                raise RuntimeError(f"nao foi possivel bloquear operacoes concorrentes: {exc}") from exc
+
+        state = load_state()
+        if args.command == "off":
+            level = 0
+        elif args.command == "on":
+            level = state["last_on"]
+        elif args.command in ("toggle", "cycle"):
+            # O estado salvo e atualizado por todos os comandos deste utilitario.
+            # Evitar uma leitura WMBB imediatamente antes da escrita torna o atalho
+            # deterministico e evita firmwares que ignoram duas chamadas seguidas.
+            current = state["current"]
+            if args.command == "toggle":
+                level = 0 if current > 0 else state["last_on"]
+            else:
+                level = (current + 1) % 3
+        elif args.command == "restore":
+            level = state["current"]
+        else:
+            level = args.level
+
+        brightness_payload(level)
+        attempts = args.retries if args.command == "restore" else 1
+        delay = args.delay if args.command == "restore" else 0
+        if attempts < 1:
+            raise ValueError("--retries deve ser pelo menos 1")
+        if delay < 0:
+            raise ValueError("--delay nao pode ser negativo")
+
+        successes = 0
+        last_error: RuntimeError | None = None
+        for attempt in range(attempts):
+            try:
+                write_level(level, dry_run=args.dry_run, force=args.force)
+                successes += 1
+            except RuntimeError as exc:
+                last_error = exc
+            if attempt + 1 < attempts and not args.dry_run:
+                time.sleep(delay)
+
+        if successes == 0 and last_error is not None:
+            raise last_error
+        if not args.dry_run:
+            save_state(level, state)
+    except (RuntimeError, ValueError) as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if lock_stream is not None:
+            lock_stream.close()
+
+    if args.dry_run:
+        return 0
+    if args.print_level:
+        print(level)
+    else:
+        print("Retroiluminacao desligada." if level == 0 else f"Brilho: {level}/2.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
